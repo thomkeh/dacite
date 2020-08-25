@@ -1,7 +1,82 @@
 from dataclasses import InitVar
-from typing import Type, Any, Optional, Union, Collection, TypeVar, Dict, Callable, Mapping, List
+from typing import Type, Any, Optional, Union, Collection, TypeVar, Dict, Callable, Mapping, List, Tuple
 
 T = TypeVar("T", bound=Any)
+
+
+class CheckAndTransform:
+    def __init__(self, type_hooks: Dict[Type, Callable[[Any], Any]], cast: List[Type], check_types: bool):
+        self.type_hooks = type_hooks
+        self.cast = cast
+        self.check_types = check_types
+
+    @property
+    def pass_(self) -> Optional[bool]:
+        return True if self.check_types else None
+
+    @property
+    def fail(self) -> Optional[bool]:
+        return False if self.check_types else None
+
+    def __call__(self, value: Any, type_: Type) -> Tuple[Any, Optional[bool]]:
+        if type_ == Any:
+            return value, self.pass_
+        elif is_optional(type_):
+            if value is None:
+                return None, self.pass_
+            type_ = extract_optional(type_)
+            return self(value, type_)
+        elif is_union(type_):
+            # for union types we cannot use type hooks or casts
+            if not self.check_types:
+                return value, None
+            types = []
+            for inner_type in extract_generic(type_):
+                if is_generic(inner_type) and not is_literal(inner_type):
+                    inner_type = extract_origin_collection(inner_type)
+                if is_new_type(inner_type):
+                    inner_type = extract_new_type(inner_type)
+                types.append(inner_type)
+            return value, any(self(value, t)[1] for t in types)
+        elif is_generic_collection(type_):
+            origin = extract_origin_collection(type_)
+            if not isinstance(value, origin):
+                return value, self.fail
+            if not _has_specified_inner_types(type_):
+                return self.pass_
+            if isinstance(value, tuple):
+                tuple_types = extract_generic(type_)
+                if len(tuple_types) == 1 and tuple_types[0] == ():
+                    return len(value) == 0
+                elif len(tuple_types) == 2 and tuple_types[1] is ...:
+                    return all(is_instance(item, tuple_types[0]) for item in value)
+                else:
+                    if len(tuple_types) != len(value):
+                        return False
+                    return all(is_instance(item, item_type) for item, item_type in zip(value, tuple_types))
+            if isinstance(value, Mapping):
+                key_type, val_type = extract_generic(type_)
+                for key, val in value.items():
+                    if not is_instance(key, key_type) or not is_instance(val, val_type):
+                        return False
+                return True
+            return all(is_instance(item, extract_generic(type_)[0]) for item in value)
+        elif is_new_type(type_):
+            return is_instance(value, extract_new_type(type_))
+        elif is_literal(type_):
+            return value in extract_generic(type_)
+        elif is_init_var(type_):
+            if hasattr(type_, "type"):
+                return is_instance(value, type_.type)
+            return True
+        else:
+            try:
+                # As described in PEP 484 - section: "The numeric tower"
+                if isinstance(value, (int, float)) and type_ in [float, complex]:
+                    return True
+                return isinstance(value, type_)
+            except TypeError:
+                return False
 
 
 def transform_value(
